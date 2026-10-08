@@ -103,3 +103,25 @@ export interface SubtitleCueEntry {
   /** Optional VTT positioning/settings string. */
   settings?: string;
 }
+  /** Metadata for a discovered audio track (sent to main thread alongside subtitleTracks). */
+export interface AudioTrackInfo {
+  /** Index within the audio tracks array (0-based). */
+  index: number;
+  /** Original codec in the container (e.g. 'ac3', 'eac3', 'aac'). */
+  codec: string;
+  /** Demuxer language code, usually ISO 639/BCP 47 (e.g. 'en', 'eng', 'und'). */
+  language: string;
+  /** User-visible track name, if any (e.g. 'VFF', 'Commentaire'). */
+  name: string | null;
+  /** Number of audio channels (1 = mono, 2 = stereo, 6 = 5.1, 8 = 7.1). */
+  channels: number;
+  /** Sample rate in Hz (e.g. 48000, 44100). */
+  sampleRate: number;
+  /** Container disposition flags. */
+  disposition: {
+    default: boolean;
+    forced: boolean;
+    hearingImpaired: boolean;
+  };
+}
+
