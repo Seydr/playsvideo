@@ -6,9 +6,39 @@ declare global {
   var documentPictureInPicture: DocumentPictureInPicture | undefined;
 }
 
+export interface AudioTrackDescriptor {
+  index: number;
+  codec: string;
+  language: string;
+  name: string | null;
+  channels: number;
+  sampleRate: number;
+}
+
+export interface SubtitleTrackDescriptor {
+  index: number;
+  codec: string;
+  language: string;
+  name: string | null;
+  /** True if the track has already been extracted and attached as a <track>. */
+  ready: boolean;
+}
+
 export interface CustomControlsOptions {
   video: HTMLVideoElement;
   container: HTMLElement;
+  /** Return the list of available audio tracks (from PlaysVideoEngine.audioTracks). */
+  getAudioTracks?: () => AudioTrackDescriptor[];
+  /** Return the currently active audio track index. */
+  getActiveAudioIndex?: () => number;
+  /** Called when the user picks a new audio track. */
+  onSelectAudioTrack?: (index: number) => void;
+  /** Return the full list of subtitle tracks (from PlaysVideoEngine.subtitleTracks). */
+  getSubtitleTracks?: () => SubtitleTrackDescriptor[];
+  /** Return the currently active subtitle index (-1 = none). */
+  getActiveSubtitleIndex?: () => number;
+  /** Called when the user picks a subtitle track (-1 = none). */
+  onSelectSubtitleTrack?: (index: number) => void;
 }
 
 export interface CustomControlsHandle {
@@ -47,6 +77,9 @@ const ICON = {
   ),
   cc: svg(
     '<path d="M19 4H5a2 2 0 00-2 2v12a2 2 0 002 2h14a2 2 0 002-2V6a2 2 0 00-2-2zm-8 7H9.5v-.5h-2v3h2V13H11v1a1 1 0 01-1 1H7a1 1 0 01-1-1v-4a1 1 0 011-1h3a1 1 0 011 1v1zm7 0h-1.5v-.5h-2v3h2V13H18v1a1 1 0 01-1 1h-3a1 1 0 01-1-1v-4a1 1 0 011-1h3a1 1 0 011 1v1z"/>',
+  ),
+  audio: svg(
+    '<path d="M12 3v10.55A4 4 0 1014 17V7h4V3h-6z"/>',
   ),
   speed: svg(
     '<path d="M20.38 8.57l-1.23 1.85a8 8 0 01-.22 7.58H5.07A8 8 0 0115.58 6.85l1.85-1.23A10 10 0 003.35 19a2 2 0 001.72 1h13.85a2 2 0 001.74-1 10 10 0 00-.27-11.44zM10.59 15.41a2 2 0 002.83 0l5.66-8.49-8.49 5.66a2 2 0 000 2.83z"/>',
@@ -293,7 +326,16 @@ function iconBtn(label: string, iconHtml: string, className = 'pv-btn'): HTMLBut
 }
 
 export function createCustomControls(options: CustomControlsOptions): CustomControlsHandle {
-  const { video, container } = options;
+  const { video, container, getAudioTracks, getActiveAudioIndex, onSelectAudioTrack } = options;
+  const audioApiEnabled = typeof getAudioTracks === 'function'
+    && typeof getActiveAudioIndex === 'function'
+    && typeof onSelectAudioTrack === 'function';
+
+  const { getSubtitleTracks, getActiveSubtitleIndex, onSelectSubtitleTrack } = options;
+  const subtitleApiEnabled = typeof getSubtitleTracks === 'function'
+    && typeof getActiveSubtitleIndex === 'function'
+    && typeof onSelectSubtitleTrack === 'function';
+
   injectStyles();
 
   // --- Build DOM ---
@@ -659,54 +701,162 @@ export function createCustomControls(options: CustomControlsOptions): CustomCont
     togglePopup(overflowAnchor, () => {
       const items: HTMLButtonElement[] = [];
 
-      // Captions — only show if tracks exist
-      const trackCount = video.textTracks.length;
-      if (trackCount > 0) {
-        let activeLang = 'Off';
-        for (let i = 0; i < trackCount; i++) {
-          if (video.textTracks[i].mode === 'showing') {
-            activeLang =
-              video.textTracks[i].label || video.textTracks[i].language || `Track ${i + 1}`;
+      // Captions — uses engine metadata if available, else falls back to video.textTracks
+      if (subtitleApiEnabled) {
+        const subs = getSubtitleTracks!();
+        if (subs && subs.length > 0) {
+          const activeIdx = getActiveSubtitleIndex!();
+
+          function formatSubtitleLabel(t: SubtitleTrackDescriptor): string {
+            const parts: string[] = [];
+            const lang = t.language && t.language !== 'und' ? t.language.toUpperCase() : '?';
+            parts.push(lang);
+            if (t.name) parts.push(t.name);
+            if (t.codec && t.codec !== 'unknown') parts.push(t.codec.toUpperCase());
+            if (!t.ready) parts.push('⏳');
+            return parts.join(' · ');
           }
-        }
-        items.push(
-          popupItem(
-            'Captions',
-            false,
-            () => {
-              openPopup(overflowAnchor, () => {
-                const subItems: HTMLButtonElement[] = [];
-                let anyShowing = false;
-                for (let i = 0; i < video.textTracks.length; i++) {
-                  if (video.textTracks[i].mode === 'showing') anyShowing = true;
-                }
-                subItems.push(
-                  popupItem('Off', !anyShowing, () => {
-                    for (let i = 0; i < video.textTracks.length; i++) {
-                      video.textTracks[i].mode = 'disabled';
-                    }
-                  }),
-                );
-                for (let i = 0; i < video.textTracks.length; i++) {
-                  const track = video.textTracks[i];
-                  const label = track.label || track.language || `Track ${i + 1}`;
+
+          let currentLabel = 'Off';
+          if (activeIdx >= 0 && activeIdx < subs.length) {
+            currentLabel = formatSubtitleLabel(subs[activeIdx]);
+          }
+
+          items.push(
+            popupItem(
+              'Captions',
+              false,
+              () => {
+                openPopup(overflowAnchor, () => {
+                  const subItems: HTMLButtonElement[] = [];
                   subItems.push(
-                    popupItem(label, track.mode === 'showing', () => {
-                      for (let j = 0; j < video.textTracks.length; j++) {
-                        video.textTracks[j].mode = 'disabled';
+                    popupItem('Off', activeIdx < 0, () => onSelectSubtitleTrack!(-1)),
+                  );
+                  for (const sub of subs) {
+                    subItems.push(
+                      popupItem(
+                        formatSubtitleLabel(sub),
+                        sub.index === activeIdx,
+                        () => onSelectSubtitleTrack!(sub.index),
+                      ),
+                    );
+                  }
+                  return subItems;
+                });
+              },
+              ICON.cc,
+              currentLabel,
+              false,
+            ),
+          );
+        }
+      } else {
+        // Fallback legacy : utilise video.textTracks
+        const trackCount = video.textTracks.length;
+        if (trackCount > 0) {
+          let activeLang = 'Off';
+          for (let i = 0; i < trackCount; i++) {
+            if (video.textTracks[i].mode === 'showing') {
+              activeLang =
+                video.textTracks[i].label || video.textTracks[i].language || `Track ${i + 1}`;
+            }
+          }
+          items.push(
+            popupItem(
+              'Captions',
+              false,
+              () => {
+                openPopup(overflowAnchor, () => {
+                  const subItems: HTMLButtonElement[] = [];
+                  let anyShowing = false;
+                  for (let i = 0; i < video.textTracks.length; i++) {
+                    if (video.textTracks[i].mode === 'showing') anyShowing = true;
+                  }
+                  subItems.push(
+                    popupItem('Off', !anyShowing, () => {
+                      for (let i = 0; i < video.textTracks.length; i++) {
+                        video.textTracks[i].mode = 'disabled';
                       }
-                      track.mode = 'showing';
                     }),
                   );
-                }
-                return subItems;
-              });
-            },
-            ICON.cc,
-            activeLang,
-            false, // don't auto-close — opens sub-menu
-          ),
-        );
+                  for (let i = 0; i < video.textTracks.length; i++) {
+                    const track = video.textTracks[i];
+                    const label = track.label || track.language || `Track ${i + 1}`;
+                    subItems.push(
+                      popupItem(label, track.mode === 'showing', () => {
+                        for (let j = 0; j < video.textTracks.length; j++) {
+                          video.textTracks[j].mode = 'disabled';
+                        }
+                        track.mode = 'showing';
+                      }),
+                    );
+                  }
+                  return subItems;
+                });
+              },
+              ICON.cc,
+              activeLang,
+              false,
+            ),
+          );
+        }
+      }
+      // Audio tracks — only shown if the engine provided audio APIs
+      if (audioApiEnabled) {
+        const audioTracks = getAudioTracks!();
+        if (audioTracks && audioTracks.length > 0) {
+          const activeIdx = getActiveAudioIndex!();
+
+          function formatAudioLabel(t: AudioTrackDescriptor): string {
+            const parts: string[] = [];
+            const lang = t.language && t.language !== 'und' ? t.language.toUpperCase() : '?';
+            parts.push(lang);
+            if (t.codec && t.codec !== 'unknown') parts.push(t.codec.toUpperCase());
+            if (t.channels) {
+              const ch = t.channels === 1 ? 'mono'
+                : t.channels === 2 ? 'stereo'
+                : t.channels === 6 ? '5.1'
+                : t.channels === 8 ? '7.1'
+                : `${t.channels}ch`;
+              parts.push(ch);
+            }
+            if (t.name) parts.push(t.name);
+            return parts.join(' · ');
+          }
+
+          let currentLabel = '—';
+          for (let i = 0; i < audioTracks.length; i++) {
+            if (audioTracks[i].index === activeIdx) {
+              currentLabel = formatAudioLabel(audioTracks[i]);
+              break;
+            }
+          }
+
+          items.push(
+            popupItem(
+              'Audio',
+              false,
+              () => {
+                openPopup(overflowAnchor, () => {
+                  const audioItems: HTMLButtonElement[] = [];
+                  for (const track of audioTracks) {
+                    audioItems.push(
+                      popupItem(
+                        formatAudioLabel(track),
+                        track.index === activeIdx,
+                        () => onSelectAudioTrack!(track.index),
+                      ),
+                    );
+                  }
+                  return audioItems;
+                });
+              },
+              ICON.audio,
+              currentLabel,
+              false, // don't auto-close — opens sub-menu
+            ),
+          );
+        }
       }
 
       // Playback speed
