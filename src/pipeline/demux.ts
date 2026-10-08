@@ -12,7 +12,7 @@ import {
 } from 'mediabunny';
 import type { Source } from '../source.js';
 import { getSubtitleTrackInfos } from './subtitle.js';
-import type { KeyframeEntry, KeyframeIndex, SubtitleTrackInfo } from './types.js';
+import type { AudioTrackInfo, KeyframeEntry, KeyframeIndex, SubtitleTrackInfo } from './types.js';
 
 export interface DemuxResult {
   input: Input;
@@ -26,6 +26,10 @@ export interface DemuxResult {
   videoSink: EncodedPacketSink;
   audioSink: EncodedPacketSink | null;
   subtitleTracks: SubtitleTrackInfo[];
+  /** All audio tracks present in the file (in container order). */
+  audioTracks: AudioTrackInfo[];
+  /** Index of the currently active audio track (0-based). */
+  activeAudioIndex: number;
   dispose: () => void;
 }
 
@@ -33,12 +37,18 @@ export async function demuxFile(filePath: string): Promise<DemuxResult> {
   return demuxInput(new Input({ formats: ALL_FORMATS, source: new FilePathSource(filePath) }));
 }
 
-export async function demuxBlob(blob: Blob): Promise<DemuxResult> {
-  return demuxInput(new Input({ formats: ALL_FORMATS, source: new BlobSource(blob) }));
+export async function demuxBlob(blob: Blob, preferredAudioIndex?: number): Promise<DemuxResult> {
+  return demuxInput(
+    new Input({ formats: ALL_FORMATS, source: new BlobSource(blob) }),
+    preferredAudioIndex,
+  );
 }
 
-export async function demuxUrl(url: string): Promise<DemuxResult> {
-  return demuxInput(new Input({ formats: ALL_FORMATS, source: new UrlSource(url) }));
+export async function demuxUrl(url: string, preferredAudioIndex?: number): Promise<DemuxResult> {
+  return demuxInput(
+    new Input({ formats: ALL_FORMATS, source: new UrlSource(url) }),
+    preferredAudioIndex,
+  );
 }
 
 class SourceAdapter extends MBSource {
@@ -60,17 +70,51 @@ export async function demuxSource(source: Source): Promise<DemuxResult> {
   return demuxInput(new Input({ formats: ALL_FORMATS, source: new SourceAdapter(source) }));
 }
 
-async function demuxInput(input: Input): Promise<DemuxResult> {
+async function demuxInput(input: Input, preferredAudioIndex?: number): Promise<DemuxResult> {
   const videoTrack = await input.getPrimaryVideoTrack();
   if (!videoTrack) {
     throw new Error('No video track found');
   }
 
-  let audioTrack: InputAudioTrack | null = null;
+  // Collect metadata for ALL audio tracks (not just the primary)
+  const audioTracks: AudioTrackInfo[] = [];
+  let allAudioTracks: InputAudioTrack[] = [];
   try {
-    audioTrack = await input.getPrimaryAudioTrack();
+    allAudioTracks = await input.getAudioTracks();
+    for (let i = 0; i < allAudioTracks.length; i++) {
+      const t = allAudioTracks[i];
+      const d = t.disposition;
+      audioTracks.push({
+        index: i,
+        codec: t.codec ?? 'unknown',
+        language: t.languageCode,
+        name: t.name,
+        channels: t.numberOfChannels,
+        sampleRate: t.sampleRate,
+        disposition: {
+          default: d.default,
+          forced: d.forced,
+          hearingImpaired: d.hearingImpaired,
+        },
+      });
+    }
   } catch {
-    // No audio track — that's fine
+    // No audio tracks at all — leave empty
+  }
+
+  // Select the active audio track:
+  // - preferredAudioIndex if valid
+  // - otherwise fall back to the first track
+  let audioTrack: InputAudioTrack | null = null;
+  let activeAudioIndex = 0;
+  if (allAudioTracks.length > 0) {
+    activeAudioIndex =
+      preferredAudioIndex !== undefined
+      && preferredAudioIndex >= 0
+      && preferredAudioIndex < allAudioTracks.length
+        ? preferredAudioIndex
+        : 0;
+    audioTrack = allAudioTracks[activeAudioIndex];
   }
 
   const videoCodec = videoTrack.codec;
@@ -107,6 +151,8 @@ async function demuxInput(input: Input): Promise<DemuxResult> {
     videoSink,
     audioSink,
     subtitleTracks,
+    audioTracks,
+    activeAudioIndex,
     dispose: () => input.dispose(),
   };
 }
