@@ -32,6 +32,7 @@ import {
 import { processSegmentWithAbort } from './pipeline/segment-processor.js';
 import { isAbortableSource } from './pipeline/source-signal.js';
 import type {
+  AudioTrackInfo,
   FfmpegRunner,
   KeyframeIndex,
   PlannedSegment,
@@ -42,6 +43,7 @@ import type { TranscodeWorkerSnapshot, TranscodeWorkerStateMessage } from './tra
 import type {
   WorkerSegmentStateMessage,
   WorkerSubtitleProgressMessage,
+  WorkerAudioTracksMessage,
 } from './worker-protocol.js';
 
 export type EnginePhase = 'idle' | 'demuxing' | 'ready' | 'error';
@@ -156,14 +158,25 @@ export interface CodecPath {
   outputAudio: CodecDescriptor;
 }
 
+export interface AudioTracksDetail {
+  tracks: AudioTrackInfo[];
+  activeIndex: number;
+}
+
 interface EngineEventMap {
   ready: CustomEvent<ReadyDetail>;
   error: CustomEvent<ErrorDetail>;
   loading: CustomEvent<LoadingDetail>;
   'subtitle-status': CustomEvent<SubtitleStatusDetail>;
+  'audio-tracks-changed': CustomEvent<AudioTracksDetail>;
   workerstatechange: CustomEvent<WorkerStateDetail>;
   segmentstatechange: CustomEvent<SegmentStateDetail>;
   playbackdecision: CustomEvent<PlaybackDecisionDetail>;
+}
+
+interface PendingAudioSwitch {
+  position: number;
+  wasPlaying: boolean;
 }
 
 interface TranscodeWorkerHandle {
@@ -222,6 +235,11 @@ export class PlaysVideoEngine extends EventTarget {
   private attachedSubtitleTracks: AttachedSubtitleTrack[] = [];
   private _subtitleTracks: SubtitleTrackInfo[] = [];
 
+  // Audio tracks state
+  private _audioTracks: AudioTrackInfo[] = [];
+  private _activeAudioIndex = 0;
+  private _pendingAudioSwitch: PendingAudioSwitch | null = null;
+
   // Public read-only state
   private _phase: EnginePhase = 'idle';
   private _totalSegments = 0;
@@ -272,6 +290,15 @@ export class PlaysVideoEngine extends EventTarget {
   }
   get subtitleTracks(): SubtitleTrackInfo[] {
     return this._subtitleTracks;
+  }
+  get audioTracks(): AudioTrackInfo[] {
+    return this._audioTracks.map((track) => ({
+      ...track,
+      disposition: { ...track.disposition },
+    }));
+  }
+  get activeAudioIndex(): number {
+    return this._activeAudioIndex;
   }
   get passthrough(): boolean {
     return this._passthrough;
@@ -371,6 +398,90 @@ export class PlaysVideoEngine extends EventTarget {
   }
 
   /**
+   * Switch to another audio track. Only works when the engine is playing via
+   * the remux/HLS pipeline (not passthrough). The engine saves the current
+   * playback position and restores it once the new track is ready.
+   */
+  selectAudioTrack(index: number): void {
+    if (this._phase !== 'ready') {
+      mlog(`selectAudioTrack ignored: engine not ready (phase=${this._phase})`);
+      return;
+    }
+    if (this._passthrough) {
+      mlog('selectAudioTrack ignored: passthrough mode does not support track switching');
+      return;
+    }
+    if (!this.worker) {
+      mlog('selectAudioTrack ignored: no worker');
+      return;
+    }
+    if (index < 0 || index >= this._audioTracks.length) {
+      mlog(`selectAudioTrack ignored: index ${index} out of range (0..${this._audioTracks.length - 1})`);
+      return;
+    }
+    if (index === this._activeAudioIndex) {
+      mlog(`selectAudioTrack ignored: already on index ${index}`);
+      return;
+    }
+
+    this._pendingAudioSwitch = {
+      position: this.video.currentTime,
+      wasPlaying: !this.video.paused && !this.video.ended,
+    };
+
+    mlog(
+      `selectAudioTrack → ${index} (was ${this._activeAudioIndex}, position=${this._pendingAudioSwitch.position.toFixed(2)}s, playing=${this._pendingAudioSwitch.wasPlaying})`,
+    );
+
+    // Optimistic UI update
+    this._activeAudioIndex = index;
+    this.dispatchAudioTracksChange();
+
+    this.worker.postMessage({ type: 'select-audio-track', index });
+  }
+
+  private dispatchAudioTracksChange(): void {
+    this.dispatchEvent(
+      new CustomEvent<AudioTracksDetail>('audio-tracks-changed', {
+        detail: {
+          tracks: this.audioTracks,
+          activeIndex: this._activeAudioIndex,
+        },
+      }),
+    );
+  }
+
+  private restorePendingAudioSwitch(): void {
+    if (!this._pendingAudioSwitch) {
+      return;
+    }
+    const { position, wasPlaying } = this._pendingAudioSwitch;
+    this._pendingAudioSwitch = null;
+
+    const applyRestore = () => {
+      if (position > 0 && Number.isFinite(this.video.duration) && this.video.duration > 0) {
+        const target = Math.min(position, Math.max(0, this.video.duration - 0.1));
+        try {
+          this.video.currentTime = target;
+          mlog(`audio switch: seek restored to ${target.toFixed(2)}s`);
+        } catch (err) {
+          mlog(`audio switch: seek failed — ${String(err)}`);
+        }
+      }
+      if (wasPlaying) {
+        this.video.play().catch(() => {});
+        mlog('audio switch: playback resumed');
+      }
+    };
+
+    if (this.video.readyState >= 1 && Number.isFinite(this.video.duration)) {
+      applyRestore();
+    } else {
+      this.video.addEventListener('loadedmetadata', applyRestore, { once: true });
+    }
+  }
+
+  /**
    * Load from an external Source (e.g. TorrentSource).
    *
    * Runs the pipeline on the main thread (no worker) because external Sources
@@ -453,6 +564,9 @@ export class PlaysVideoEngine extends EventTarget {
     this._totalSegments = 0;
     this._durationSec = 0;
     this._subtitleTracks = [];
+    this._audioTracks = [];
+    this._activeAudioIndex = 0;
+    this._pendingAudioSwitch = null;
     this._passthrough = false;
     this._pendingFileType = null;
     this._keyframeIndex = null;
@@ -950,11 +1064,33 @@ export class PlaysVideoEngine extends EventTarget {
         this.worker!.postMessage(remuxMsg);
       }
     } else if (msg.type === 'ready') {
+      // If this is an audio switch, HLS is still running — tear it down first
+      const isAudioSwitch = this._pendingAudioSwitch !== null;
+      if (this.hls) {
+        mlog(`ready: destroying previous hls instance (audio switch=${isAudioSwitch})`);
+        this.hls.destroy();
+        this.hls = null;
+      }
+      // Clear old pending segment promises from the previous HLS session
+      for (const [, pending] of this.pendingSegments) {
+        try {
+          pending.reject(new DOMException('Segment superseded by audio switch', 'AbortError'));
+        } catch { /* ignore */ }
+      }
+      this.pendingSegments.clear();
+      this.segmentRequestTimes.clear();
+
       this.playlist = msg.playlist;
       this.initData = msg.initData;
       this._totalSegments = msg.totalSegments;
       this._durationSec = msg.durationSec;
       this._subtitleTracks = msg.subtitleTracks ?? [];
+      if (typeof msg.activeAudioIndex === 'number') {
+        this._activeAudioIndex = msg.activeAudioIndex;
+      }
+      if (Array.isArray(msg.audioTracks)) {
+        this._audioTracks = msg.audioTracks;
+      }
       this._phase = 'ready';
       this._codecPath = {
         mode: 'pipeline',
@@ -988,17 +1124,25 @@ export class PlaysVideoEngine extends EventTarget {
         this.pendingInit = null;
       }
 
-      // Request subtitle extraction for all embedded tracks
-      if (this._subtitleTracks.length > 0) {
-        this.dispatchSubtitleStatus(
-          `Extracting ${this._subtitleTracks.length} subtitle track(s)...`,
-        );
-      } else {
-        this.dispatchSubtitleStatus('No embedded subtitles');
+            // Request subtitle extraction for all embedded tracks.
+      // Skip on audio switch — subtitles are already attached.
+      const hasAttachedEmbeddedSubtitles = this.attachedSubtitleTracks.some(
+        (t) => t.source === 'embedded',
+      );
+      if (!hasAttachedEmbeddedSubtitles) {
+        if (this._subtitleTracks.length > 0) {
+          this.dispatchSubtitleStatus(
+            `Extracting ${this._subtitleTracks.length} subtitle track(s)...`,
+          );
+        } else {
+          this.dispatchSubtitleStatus('No embedded subtitles');
+        }
+        for (const track of this._subtitleTracks) {
+          this.requestEmbeddedSubtitleTrack(track);
+        }
       }
-      for (const track of this._subtitleTracks) {
-        this.requestEmbeddedSubtitleTrack(track);
-      }
+
+      this.dispatchAudioTracksChange();
 
       this.dispatchEvent(
         new CustomEvent('ready', {
@@ -1012,6 +1156,7 @@ export class PlaysVideoEngine extends EventTarget {
       );
 
       this.startHls();
+      this.restorePendingAudioSwitch();
     } else if (msg.type === 'subtitle') {
       mlog(`subtitle arrived track=${msg.trackIndex} codec=${msg.codec} len=${msg.webvtt?.length}`);
       this.subtitleRequestTimes.delete(msg.trackIndex);
@@ -1029,6 +1174,17 @@ export class PlaysVideoEngine extends EventTarget {
         defaultTrack: this.shouldAutoSelectEmbeddedSubtitle(msg.trackIndex),
         selectTrack: this.shouldAutoSelectEmbeddedSubtitle(msg.trackIndex),
       });
+    } else if (msg.type === 'audio-tracks') {
+      const audioMsg = msg as WorkerAudioTracksMessage;
+      const changed =
+        audioMsg.activeIndex !== this._activeAudioIndex
+        || audioMsg.tracks.length !== this._audioTracks.length;
+      this._audioTracks = audioMsg.tracks ?? [];
+      this._activeAudioIndex = audioMsg.activeIndex ?? 0;
+      mlog(
+        `audio-tracks updated count=${this._audioTracks.length} active=${this._activeAudioIndex} changed=${changed}`,
+      );
+      this.dispatchAudioTracksChange();
     } else if (msg.type === 'subtitle-progress') {
       this.handleWorkerSubtitleProgress(msg);
     } else if (msg.type === 'segment-state') {
