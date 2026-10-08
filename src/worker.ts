@@ -33,6 +33,8 @@ import type {
   WorkerSegmentPhase,
   WorkerSegmentStateMessage,
   WorkerSubtitleProgressMessage,
+  WorkerAudioTracksMessage,
+  SelectAudioTrackMessage,
 } from './worker-protocol.js';
 
 function wlog(msg: string) {
@@ -305,6 +307,7 @@ let audioDecoderConfig: AudioDecoderConfig | null = null;
 let initSegment: Uint8Array | null = null;
 let currentBlob: Blob | null = null;
 let currentUrl: string | null = null;
+let activeAudioIndex = 0;
 const segmentCache = new Map<number, Uint8Array>();
 const segmentTasks = new Map<number, Promise<Uint8Array>>();
 let targetSegDuration = 4;
@@ -323,12 +326,14 @@ self.onmessage = (event: MessageEvent) => {
     targetSegDuration = msg.targetSegmentDuration ?? 4;
     currentBlob = msg.file;
     currentUrl = null;
+    activeAudioIndex = 0;
     queuePipelineSetup(() => handleProbe(() => demuxBlob(msg.file)));
   } else if (msg.type === 'open-url') {
     wlog('recv open-url');
     targetSegDuration = msg.targetSegmentDuration ?? 4;
     currentBlob = null;
     currentUrl = msg.url;
+    activeAudioIndex = 0;
     queuePipelineSetup(() => handleProbe(() => demuxUrl(msg.url)));
   } else if (msg.type === 'remux-pipeline') {
     wlog('recv remux-pipeline');
@@ -366,6 +371,10 @@ self.onmessage = (event: MessageEvent) => {
     handleSubtitle(msg.trackIndex, Math.max(0, queueDelayMs)).catch((err) =>
       self.postMessage({ type: 'error', message: String(err) }),
     );
+  } else if (msg.type === 'select-audio-track') {
+    const audioMsg = msg as SelectAudioTrackMessage;
+    wlog(`recv select-audio-track index=${audioMsg.index}`);
+    queuePipelineSetup(() => handleSelectAudioTrack(audioMsg.index));
   }
 };
 
@@ -480,6 +489,7 @@ async function handleProbe(demuxFn: () => Promise<DemuxResult>) {
 
   const tDemux = performance.now();
   demux = await demuxFn();
+  activeAudioIndex = demux.activeAudioIndex;
   wlog(
     `demux done ${elapsed(tDemux)} codec=${demux.videoCodec}/${demux.audioCodec} dur=${demux.duration.toFixed(1)}s`,
   );
@@ -494,6 +504,15 @@ async function handleProbe(demuxFn: () => Promise<DemuxResult>) {
     durationSec: demux.duration,
     subtitleTracks: demux.subtitleTracks,
   });
+
+  // Send the full audio tracks list right away
+  const audioTracksMsg: WorkerAudioTracksMessage = {
+    type: 'audio-tracks',
+    tracks: demux.audioTracks,
+    activeIndex: activeAudioIndex,
+  };
+  self.postMessage(audioTracksMsg);
+  wlog(`audio-tracks emitted count=${demux.audioTracks.length} active=${activeAudioIndex}`);
 }
 
 /** Phase 2: full pipeline — engine told us native playback isn't possible. */
@@ -577,6 +596,8 @@ async function handleRemuxPipeline(prebuiltKeyframeIndex?: KeyframeIndex) {
       outputAudioCodec: doTranscode ? 'aac' : demux.audioCodec,
       outputAudioCodecFull: audioDecoderConfig?.codec ?? null,
       subtitleTracks: demux.subtitleTracks,
+      audioTracks: demux.audioTracks,
+      activeAudioIndex,
     },
     { transfer: [] },
   ); // don't transfer initData — we need to keep it
@@ -590,12 +611,60 @@ async function handleFileRefresh(file: Blob): Promise<void> {
   if (demux) {
     demux.dispose();
   }
-  demux = await demuxBlob(file);
+  demux = await demuxBlob(file, activeAudioIndex);
   segmentCache.clear();
   segmentTasks.clear();
   initSegment = null;
   wlog(`file-refresh re-demux done ${elapsed(t0)} — plan kept (${plan.length} segments)`);
   self.postMessage({ type: 'file-refreshed' });
+}
+
+/**
+ * Switch to another audio track. Re-demuxes the source with the requested
+ * audio index, rebuilds the entire pipeline, and re-emits a 'ready' message
+ * so the engine can reload HLS.
+ */
+async function handleSelectAudioTrack(index: number): Promise<void> {
+  if (!currentBlob && !currentUrl) {
+    throw new Error('No media loaded — cannot select audio track');
+  }
+  if (!demux) {
+    throw new Error('No demux available — cannot select audio track');
+  }
+  if (index < 0 || index >= demux.audioTracks.length) {
+    throw new Error(
+      `Audio track index ${index} out of range (0..${demux.audioTracks.length - 1})`,
+    );
+  }
+  if (index === activeAudioIndex) {
+    wlog(`select-audio-track no-op (already on ${index})`);
+    return;
+  }
+
+  wlog(`select-audio-track switching from ${activeAudioIndex} to ${index}`);
+  const t0 = performance.now();
+
+  // Cancel any in-flight segment work and reset caches before re-demux
+  for (const controller of segmentAbortControllers.values()) {
+    try { controller.abort(); } catch { /* ignore */ }
+  }
+  segmentAbortControllers.clear();
+  segmentCache.clear();
+  segmentTasks.clear();
+  initSegment = null;
+
+  // Update active index BEFORE re-demux so 'probed'/'audio-tracks' reflect it
+  activeAudioIndex = index;
+
+  const demuxFn = currentBlob
+    ? () => demuxBlob(currentBlob!, index)
+    : () => demuxUrl(currentUrl!, index);
+
+    // Only re-probe; the engine will trigger the remux-pipeline when it
+  // receives the 'probed' message (same flow as initial load).
+  await handleProbe(demuxFn);
+
+  wlog(`select-audio-track probe done ${elapsed(t0)} — waiting for engine to re-trigger pipeline`);
 }
 
 function isStaleFileError(err: unknown): boolean {
