@@ -4,6 +4,22 @@ All notable changes to playsvideo are documented here.
 
 ## [Unreleased]
 
+### Added
+- Multi-track audio support: demux now discovers all audio tracks with metadata (codec, language, channels, sample rate, disposition)
+- Audio track switching via `engine.selectAudioTrack(index)` with playback position and play/pause state restored after the switch
+- `audioTracks` and `activeAudioIndex` getters on `PlaysVideoEngine`
+- `audio-tracks-changed` engine event dispatched when the track list or active index changes
+- Audio and subtitle track selection in `createCustomControls` overflow menu (hierarchical Captions and Audio sub-menus)
+- `getAudioTracks`, `getActiveAudioIndex`, `onSelectAudioTrack`, `getSubtitleTracks`, `getActiveSubtitleIndex`, `onSelectSubtitleTrack` options in `CustomControlsOptions`
+- Worker protocol messages `audio-tracks` (worker → main) and `select-audio-track` (main → worker)
+
+### Changed
+- `CustomControlsOptions` extended with optional audio and subtitle track descriptors; existing code remains compatible
+- Subtitle track menu uses engine metadata when available, with fallback to `video.textTracks` when the engine does not provide the API
+
+### Fixed
+- Subtitle menu correctly shows the active language label when using the engine-provided track list
+
 ## [0.4.7] - 2026-03-14
 
 ### Fixed
